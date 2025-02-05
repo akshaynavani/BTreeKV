@@ -21,3 +21,31 @@ add_library(btreekv STATIC
 target_include_directories(btreekv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(btreekv PUBLIC Threads::Threads)
 target_compile_options(btreekv PRIVATE -Wall -Wextra -Wpedantic)
+
+option(BTREEKV_BUILD_TESTS "Build the GoogleTest suite" ON)
+option(BTREEKV_USE_SYSTEM_GTEST "Use an installed GoogleTest instead of fetching it" OFF)
+
+if(BTREEKV_BUILD_TESTS)
+  enable_testing()
+  if(BTREEKV_USE_SYSTEM_GTEST)
+    find_package(GTest REQUIRED)
+  else()
+    include(FetchContent)
+    FetchContent_Declare(
+      googletest
+      URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+  endif()
+
+  add_executable(btreekv_tests
+    tests/disk_manager_test.cpp
+  )
+  target_link_libraries(btreekv_tests PRIVATE btreekv GTest::gtest_main)
+  target_include_directories(btreekv_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+  include(GoogleTest)
+  gtest_discover_tests(btreekv_tests DISCOVERY_TIMEOUT 30)
+endif()
