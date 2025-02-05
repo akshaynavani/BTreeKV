@@ -16,6 +16,7 @@ find_package(Threads REQUIRED)
 
 add_library(btreekv STATIC
   src/disk_manager.cpp
+  src/meta_page.cpp
 )
 target_include_directories(btreekv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(btreekv PUBLIC Threads::Threads)
