@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "btreekv/config.h"
+#include "btreekv/page_guard.h"
 #include "btreekv/rwlatch.h"
 
 namespace btreekv {
@@ -74,6 +75,12 @@ class BufferPool {
   // (freshly allocated or recycled from the free list): no disk read, the
   // bytes are zeroed and the frame is marked dirty.
   Frame* NewPage(page_id_t id);
+
+  // Fetch/allocate a page and wrap it in a latched RAII guard. The guard owns
+  // the pin and releases latch and pin together.
+  ReadPageGuard FetchRead(page_id_t id);
+  WritePageGuard FetchWrite(page_id_t id);
+  WritePageGuard NewWrite(page_id_t id);
 
   // Drops one pin. `dirty` is OR-ed into the frame's dirty bit. Returns false
   // if the page is not resident or not pinned.
