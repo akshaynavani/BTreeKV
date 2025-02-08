@@ -43,6 +43,7 @@ if(BTREEKV_BUILD_TESTS)
   endif()
 
   add_executable(btreekv_tests
+    tests/buffer_pool_test.cpp
     tests/disk_manager_test.cpp
   )
   target_link_libraries(btreekv_tests PRIVATE btreekv GTest::gtest_main)
