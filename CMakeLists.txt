@@ -48,6 +48,7 @@ if(BTREEKV_BUILD_TESTS)
   add_executable(btreekv_tests
     tests/buffer_pool_test.cpp
     tests/disk_manager_test.cpp
+    tests/page_layout_test.cpp
   )
   target_link_libraries(btreekv_tests PRIVATE btreekv GTest::gtest_main)
   target_include_directories(btreekv_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
