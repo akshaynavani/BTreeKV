@@ -55,6 +55,17 @@ class BTree {
   // exceeds kMaxValueSize.
   bool Put(std::string_view key, std::string_view value);
 
+  // Removes `key`. Returns true if it was present.
+  //
+  // A leaf that falls below a quarter full absorbs its right sibling when
+  // both share a parent and their entries fit in one page; the sibling's page
+  // goes onto the free list. If that leaves the root with a single child, the
+  // root is freed and the child takes its place. Internal nodes are never
+  // merged or redistributed, so after heavy deletion the tree can keep sparse
+  // internal nodes (and leaves that are the rightmost child of their parent
+  // can stay underfull); searches remain correct, only space is wasted.
+  bool Delete(std::string_view key);
+
   // Writes the meta page and every dirty page to disk and fsyncs.
   void Flush();
 
@@ -81,6 +92,13 @@ class BTree {
   // Hands out a page for a new node: from the free list if possible,
   // otherwise by growing the file. The page comes back zeroed, latched, dirty.
   WritePageGuard AllocatePage();
+
+  // Pushes a page onto the free list.
+  void FreePage(WritePageGuard guard);
+
+  // After a delete: merge the (underfull) leaf at the bottom of ctx->path
+  // with its right sibling if possible, collapsing the root if it empties.
+  void MergeWithRightSibling(WriteContext* ctx);
 
   void SplitLeaf(WritePageGuard& leaf_guard, std::string_view key, std::string_view value,
                  std::string* separator, page_id_t* right_id);

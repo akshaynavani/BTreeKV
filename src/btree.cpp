@@ -15,6 +15,10 @@ namespace btreekv {
 
 namespace {
 
+// A leaf left with fewer used bytes than this after a delete tries to merge
+// with its right sibling.
+constexpr size_t kMergeThreshold = SlottedPage::kCapacity / 4;
+
 // Node views take a mutable pointer; read paths only call their const
 // members on pages held under a read latch.
 char* Bytes(const ReadPageGuard& guard) { return const_cast<char*>(guard.data()); }
@@ -224,14 +228,25 @@ bool BTree::IsSafe(WritePageGuard& guard, std::string_view key, std::string_view
       // conservative here only means holding the parent a little longer.
       return page.FreeSpace() >= SlottedPage::EntrySize(key.size(), value.size());
     }
-    return true;
+    // Delete: safe unless removing the key would push the leaf under the
+    // merge threshold. A missing key changes nothing at all.
+    LeafNode leaf(guard.data());
+    const std::optional<uint16_t> slot = leaf.Find(key);
+    if (!slot) {
+      return true;
+    }
+    const size_t freed = SlottedPage::EntrySize(key.size(), leaf.ValueAt(*slot).size());
+    return leaf.UsedBytes() - freed >= kMergeThreshold;
   }
 
   InternalNode node(guard.data());
   if (op == WriteOp::kInsert) {
     return node.HasRoomForSeparator();
   }
-  return true;
+  // Delete: a child merge removes one separator from this node. That only
+  // matters for a root down to its last separator (it would collapse), but
+  // treating every one-separator node as unsafe keeps the rule uniform.
+  return node.num_keys() > 1;
 }
 
 void BTree::DescendForWrite(std::string_view key, std::string_view value, WriteOp op, WriteContext* ctx) {
@@ -273,6 +288,15 @@ WritePageGuard BTree::AllocatePage() {
     id = disk_->AllocatePage();
   }
   return pool_->NewWrite(id);
+}
+
+void BTree::FreePage(WritePageGuard guard) {
+  const page_id_t id = guard.page_id();
+  SlottedPage page(guard.data());
+  page.Init(PageType::kFree, id, 0);
+  page.set_link(free_list_head_);
+  free_list_head_ = id;
+  guard.MarkDirty();
 }
 
 void BTree::SplitLeaf(WritePageGuard& leaf_guard, std::string_view key, std::string_view value,
@@ -449,6 +473,71 @@ bool BTree::Put(std::string_view key, std::string_view value) {
     num_entries_.fetch_add(1, std::memory_order_relaxed);
   }
   return !existed;
+}
+
+void BTree::MergeWithRightSibling(WriteContext* ctx) {
+  const size_t leaf_index = ctx->path.size() - 1;
+  WritePageGuard& parent_guard = ctx->path[leaf_index - 1];
+  WritePageGuard& leaf_guard = ctx->path[leaf_index];
+  InternalNode parent(parent_guard.data());
+  const size_t child = ctx->child_index[leaf_index - 1];
+
+  // Only merge rightward, within the same parent. Latching a left sibling
+  // would go against the left-to-right order scans use and could deadlock.
+  if (child >= parent.num_keys()) {
+    return;
+  }
+
+  WritePageGuard sibling_guard = pool_->FetchWrite(parent.ChildAt(child + 1));
+  LeafNode leaf(leaf_guard.data());
+  LeafNode sibling(sibling_guard.data());
+  if (leaf.UsedBytes() + sibling.UsedBytes() > SlottedPage::kCapacity) {
+    return;
+  }
+
+  // Every key in the sibling sorts after every key in this leaf.
+  for (uint16_t i = 0; i < sibling.size(); ++i) {
+    if (!leaf.Append(sibling.KeyAt(i), sibling.ValueAt(i))) {
+      throw std::logic_error("leaf merge overflowed after size check");
+    }
+  }
+  leaf.set_next_leaf(sibling.next_leaf());
+  leaf_guard.MarkDirty();
+
+  // Separator `child` sits between this leaf and the sibling.
+  parent.RemoveAt(static_cast<uint16_t>(child));
+  parent_guard.MarkDirty();
+  FreePage(std::move(sibling_guard));
+
+  if (parent.num_keys() == 0 && ctx->root_guard && parent_guard.page_id() == root_page_id_) {
+    // The root has a single child left; make that child the root.
+    root_page_id_ = parent.ChildAt(0);
+    height_.fetch_sub(1);
+    FreePage(std::move(parent_guard));
+  }
+}
+
+bool BTree::Delete(std::string_view key) {
+  if (key.size() > kMaxKeySize) {
+    return false;
+  }
+  std::lock_guard<std::mutex> writer(writer_mu_);
+
+  WriteContext ctx;
+  DescendForWrite(key, std::string_view(), WriteOp::kDelete, &ctx);
+  WritePageGuard& leaf_guard = ctx.path.back();
+  LeafNode leaf(leaf_guard.data());
+  if (!leaf.Remove(key)) {
+    return false;
+  }
+  leaf_guard.MarkDirty();
+  num_entries_.fetch_sub(1, std::memory_order_relaxed);
+
+  // An unsafe leaf kept its parent latched; a safe one is alone in the path.
+  if (ctx.path.size() >= 2 && leaf.UsedBytes() < kMergeThreshold) {
+    MergeWithRightSibling(&ctx);
+  }
+  return true;
 }
 
 }  // namespace btreekv
