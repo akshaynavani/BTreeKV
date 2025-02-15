@@ -1,7 +1,10 @@
 #include "btreekv/btree.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "btreekv/internal_node.h"
 #include "btreekv/leaf_node.h"
@@ -18,7 +21,72 @@ char* Bytes(const ReadPageGuard& guard) { return const_cast<char*>(guard.data())
 
 bool IsLeaf(const char* data) { return SlottedPage(const_cast<char*>(data)).type() == PageType::kLeaf; }
 
+void ValidateEntry(std::string_view key, std::string_view value) {
+  if (key.size() > kMaxKeySize) {
+    throw std::invalid_argument("key is " + std::to_string(key.size()) + " bytes; the limit is " +
+                                std::to_string(kMaxKeySize));
+  }
+  if (value.size() > kMaxValueSize) {
+    throw std::invalid_argument("value is " + std::to_string(value.size()) + " bytes; the limit is " +
+                                std::to_string(kMaxValueSize));
+  }
+}
+
+// Picks a split point for an overflowing node whose entries (in key order)
+// have the given byte footprints. Entries [0, k) stay in the left node and
+// entries [k + gap, n) move to the right node; with gap == 1 the entry at k is
+// pushed up to the parent (internal split), with gap == 0 nothing is skipped
+// (leaf split). Splits by bytes rather than by count, choosing the k that
+// minimises the fuller half, so variable-length entries always fit.
+size_t ChooseSplit(const std::vector<size_t>& sizes, size_t gap) {
+  const size_t n = sizes.size();
+  std::vector<size_t> prefix(n + 1, 0);
+  for (size_t i = 0; i < n; ++i) {
+    prefix[i + 1] = prefix[i] + sizes[i];
+  }
+
+  size_t best = 0;
+  size_t best_cost = SIZE_MAX;
+  for (size_t k = 1; k + gap < n; ++k) {
+    const size_t left = prefix[k];
+    const size_t right = prefix[n] - prefix[k + gap];
+    if (left > SlottedPage::kCapacity || right > SlottedPage::kCapacity) {
+      continue;
+    }
+    const size_t cost = std::max(left, right);
+    if (cost < best_cost) {
+      best_cost = cost;
+      best = k;
+    }
+  }
+  if (best == 0) {
+    throw std::logic_error("no split point leaves both halves within a page");
+  }
+  return best;
+}
+
 }  // namespace
+
+// The pages a writer currently holds, top-down. `path` is a contiguous chain:
+// path[i + 1] is child number child_index[i] of path[i]. If root_guard is
+// engaged, path[0] is the root and the root pointer is latched exclusively.
+struct BTree::WriteContext {
+  std::optional<WriteLatchGuard> root_guard;
+  std::vector<WritePageGuard> path;
+  std::vector<size_t> child_index;
+
+  // Called when the newest page in `path` is safe: nothing above it can
+  // change any more, so let readers back in.
+  void ReleaseAncestors() {
+    root_guard.reset();
+    if (path.size() > 1) {
+      WritePageGuard last = std::move(path.back());
+      path.clear();
+      path.push_back(std::move(last));
+    }
+    child_index.clear();
+  }
+};
 
 BTree::BTree(const std::string& path, const BTreeOptions& options) {
   if (options.pool_frames < kMinPoolFrames) {
@@ -144,6 +212,243 @@ std::optional<std::string> BTree::Get(std::string_view key) const {
     return std::nullopt;
   }
   return value;
+}
+
+// ---- Writes ----------------------------------------------------------------
+
+bool BTree::IsSafe(WritePageGuard& guard, std::string_view key, std::string_view value, WriteOp op) const {
+  SlottedPage page(guard.data());
+  if (page.type() == PageType::kLeaf) {
+    if (op == WriteOp::kInsert) {
+      // Even an overwrite is judged by the full new entry; being
+      // conservative here only means holding the parent a little longer.
+      return page.FreeSpace() >= SlottedPage::EntrySize(key.size(), value.size());
+    }
+    return true;
+  }
+
+  InternalNode node(guard.data());
+  if (op == WriteOp::kInsert) {
+    return node.HasRoomForSeparator();
+  }
+  return true;
+}
+
+void BTree::DescendForWrite(std::string_view key, std::string_view value, WriteOp op, WriteContext* ctx) {
+  ctx->path.reserve(Height() + 1);
+  ctx->child_index.reserve(Height());
+
+  ctx->root_guard.emplace(root_latch_);
+  WritePageGuard root = pool_->FetchWrite(root_page_id_);
+  const bool root_safe = IsSafe(root, key, value, op);
+  ctx->path.push_back(std::move(root));
+  if (root_safe) {
+    ctx->root_guard.reset();
+  }
+
+  while (!IsLeaf(ctx->path.back().data())) {
+    InternalNode node(ctx->path.back().data());
+    const uint16_t index = node.ChildIndexFor(key);
+    WritePageGuard child = pool_->FetchWrite(node.ChildAt(index));
+    const bool safe = IsSafe(child, key, value, op);
+    ctx->child_index.push_back(index);
+    ctx->path.push_back(std::move(child));
+    if (safe) {
+      ctx->ReleaseAncestors();
+    }
+  }
+}
+
+WritePageGuard BTree::AllocatePage() {
+  page_id_t id;
+  if (free_list_head_ != kInvalidPageId) {
+    id = free_list_head_;
+    ReadPageGuard guard = pool_->FetchRead(id);
+    const SlottedPage page(Bytes(guard));
+    if (page.type() != PageType::kFree) {
+      throw std::runtime_error("free list points at page " + std::to_string(id) + " which is not free");
+    }
+    free_list_head_ = page.link();
+  } else {
+    id = disk_->AllocatePage();
+  }
+  return pool_->NewWrite(id);
+}
+
+void BTree::SplitLeaf(WritePageGuard& leaf_guard, std::string_view key, std::string_view value,
+                      std::string* separator, page_id_t* right_id) {
+  LeafNode leaf(leaf_guard.data());
+
+  // Materialize the leaf's contents with the new entry merged in.
+  std::vector<std::pair<std::string, std::string>> entries;
+  entries.reserve(static_cast<size_t>(leaf.size()) + 1);
+  bool placed = false;
+  for (uint16_t i = 0; i < leaf.size(); ++i) {
+    const std::string_view k = leaf.KeyAt(i);
+    if (!placed && key <= k) {
+      entries.emplace_back(std::string(key), std::string(value));
+      placed = true;
+      if (k == key) {
+        continue;  // overwrite: drop the old value
+      }
+    }
+    entries.emplace_back(std::string(k), std::string(leaf.ValueAt(i)));
+  }
+  if (!placed) {
+    entries.emplace_back(std::string(key), std::string(value));
+  }
+
+  std::vector<size_t> sizes;
+  sizes.reserve(entries.size());
+  for (const auto& e : entries) {
+    sizes.push_back(SlottedPage::EntrySize(e.first.size(), e.second.size()));
+  }
+  const size_t split = ChooseSplit(sizes, 0);
+
+  // The new right sibling takes over the old next link. Nobody can reach it
+  // until we release this leaf (via the next link) or the parent (via the
+  // separator), and we hold both.
+  WritePageGuard right_guard = AllocatePage();
+  LeafNode right(right_guard.data());
+  right.Init(right_guard.page_id());
+  right.set_next_leaf(leaf.next_leaf());
+  for (size_t i = split; i < entries.size(); ++i) {
+    if (!right.Append(entries[i].first, entries[i].second)) {
+      throw std::logic_error("right half of a leaf split does not fit");
+    }
+  }
+
+  leaf.Init(leaf_guard.page_id());
+  leaf.set_next_leaf(right_guard.page_id());
+  for (size_t i = 0; i < split; ++i) {
+    if (!leaf.Append(entries[i].first, entries[i].second)) {
+      throw std::logic_error("left half of a leaf split does not fit");
+    }
+  }
+  leaf_guard.MarkDirty();
+  right_guard.MarkDirty();
+
+  // B+tree copy-up: the right leaf's first key becomes the separator.
+  *separator = entries[split].first;
+  *right_id = right_guard.page_id();
+}
+
+void BTree::SplitInternal(WritePageGuard& node_guard, uint16_t pos, const std::string& key, page_id_t child,
+                          std::string* separator, page_id_t* right_id) {
+  InternalNode node(node_guard.data());
+  const uint8_t level = node.level();
+
+  std::vector<std::string> keys;
+  std::vector<page_id_t> children;
+  keys.reserve(static_cast<size_t>(node.num_keys()) + 1);
+  children.reserve(node.num_children() + 1);
+  children.push_back(node.ChildAt(0));
+  for (uint16_t i = 0; i < node.num_keys(); ++i) {
+    keys.emplace_back(node.KeyAt(i));
+    children.push_back(node.ChildAt(static_cast<size_t>(i) + 1));
+  }
+  keys.insert(keys.begin() + pos, key);
+  children.insert(children.begin() + pos + 1, child);
+
+  std::vector<size_t> sizes;
+  sizes.reserve(keys.size());
+  for (const std::string& k : keys) {
+    sizes.push_back(SlottedPage::EntrySize(k.size(), InternalNode::kChildSize));
+  }
+  // keys[mid] moves up; its right child becomes the new node's leftmost.
+  const size_t mid = ChooseSplit(sizes, 1);
+
+  WritePageGuard right_guard = AllocatePage();
+  InternalNode right(right_guard.data());
+  right.Init(right_guard.page_id(), level, children[mid + 1]);
+  for (size_t i = mid + 1; i < keys.size(); ++i) {
+    if (!right.InsertAt(right.num_keys(), keys[i], children[i + 1])) {
+      throw std::logic_error("right half of an internal split does not fit");
+    }
+  }
+
+  node.Init(node_guard.page_id(), level, children[0]);
+  for (size_t i = 0; i < mid; ++i) {
+    if (!node.InsertAt(node.num_keys(), keys[i], children[i + 1])) {
+      throw std::logic_error("left half of an internal split does not fit");
+    }
+  }
+  node_guard.MarkDirty();
+  right_guard.MarkDirty();
+
+  *separator = keys[mid];
+  *right_id = right_guard.page_id();
+}
+
+void BTree::InsertIntoParent(WriteContext* ctx, size_t index, std::string separator, page_id_t right_id) {
+  while (true) {
+    if (index == 0) {
+      // The node that split is the top of our latched path. It must be the
+      // root, or the safety checks released an ancestor they should not have.
+      WritePageGuard& old_root = ctx->path[0];
+      if (!ctx->root_guard || old_root.page_id() != root_page_id_) {
+        throw std::logic_error("split propagated above the latched path");
+      }
+      const uint8_t level = SlottedPage(old_root.data()).level();
+      WritePageGuard new_root = AllocatePage();
+      InternalNode root(new_root.data());
+      root.Init(new_root.page_id(), static_cast<uint8_t>(level + 1), old_root.page_id());
+      if (!root.InsertAt(0, separator, right_id)) {
+        throw std::logic_error("separator does not fit in an empty root");
+      }
+      new_root.MarkDirty();
+      root_page_id_ = new_root.page_id();
+      height_.fetch_add(1);
+      return;
+    }
+
+    WritePageGuard& parent_guard = ctx->path[index - 1];
+    InternalNode parent(parent_guard.data());
+    const auto pos = static_cast<uint16_t>(ctx->child_index[index - 1]);
+    if (parent.InsertAt(pos, separator, right_id)) {
+      parent_guard.MarkDirty();
+      return;
+    }
+
+    std::string up;
+    page_id_t new_right;
+    SplitInternal(parent_guard, pos, separator, right_id, &up, &new_right);
+    separator = std::move(up);
+    right_id = new_right;
+    --index;
+  }
+}
+
+bool BTree::Put(std::string_view key, std::string_view value) {
+  ValidateEntry(key, value);
+  std::lock_guard<std::mutex> writer(writer_mu_);
+
+  WriteContext ctx;
+  DescendForWrite(key, value, WriteOp::kInsert, &ctx);
+  WritePageGuard& leaf_guard = ctx.path.back();
+  LeafNode leaf(leaf_guard.data());
+
+  switch (leaf.Upsert(key, value)) {
+    case LeafNode::UpsertResult::kInserted:
+      leaf_guard.MarkDirty();
+      num_entries_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    case LeafNode::UpsertResult::kUpdated:
+      leaf_guard.MarkDirty();
+      return false;
+    case LeafNode::UpsertResult::kNoSpace:
+      break;
+  }
+
+  const bool existed = leaf.Find(key).has_value();
+  std::string separator;
+  page_id_t right_id;
+  SplitLeaf(leaf_guard, key, value, &separator, &right_id);
+  InsertIntoParent(&ctx, ctx.path.size() - 1, std::move(separator), right_id);
+  if (!existed) {
+    num_entries_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return !existed;
 }
 
 }  // namespace btreekv

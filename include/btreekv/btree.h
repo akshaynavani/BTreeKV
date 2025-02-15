@@ -50,6 +50,11 @@ class BTree {
   bool Get(std::string_view key, std::string* value) const;
   std::optional<std::string> Get(std::string_view key) const;
 
+  // Inserts or overwrites. Returns true if `key` was not present before.
+  // Throws std::invalid_argument if the key exceeds kMaxKeySize or the value
+  // exceeds kMaxValueSize.
+  bool Put(std::string_view key, std::string_view value);
+
   // Writes the meta page and every dirty page to disk and fsyncs.
   void Flush();
 
@@ -62,6 +67,29 @@ class BTree {
   void Bootstrap();
   void LoadMeta();
   void WriteMeta();
+
+  enum class WriteOp { kInsert, kDelete };
+  struct WriteContext;
+
+  // Write-crabs from the root to the leaf for `key`, leaving in `ctx` the
+  // exclusively latched pages the operation might still modify.
+  void DescendForWrite(std::string_view key, std::string_view value, WriteOp op, WriteContext* ctx);
+
+  // Whether `op` on this node is guaranteed not to propagate to its parent.
+  bool IsSafe(WritePageGuard& guard, std::string_view key, std::string_view value, WriteOp op) const;
+
+  // Hands out a page for a new node: from the free list if possible,
+  // otherwise by growing the file. The page comes back zeroed, latched, dirty.
+  WritePageGuard AllocatePage();
+
+  void SplitLeaf(WritePageGuard& leaf_guard, std::string_view key, std::string_view value,
+                 std::string* separator, page_id_t* right_id);
+  void SplitInternal(WritePageGuard& node_guard, uint16_t pos, const std::string& key, page_id_t child,
+                     std::string* separator, page_id_t* right_id);
+
+  // Inserts (separator, right_id) into the parent of ctx->path[index],
+  // splitting upward as needed and growing a new root at the top.
+  void InsertIntoParent(WriteContext* ctx, size_t index, std::string separator, page_id_t right_id);
 
   // Read-crabs from the root to the leaf that would contain `key` (or to the
   // leftmost leaf) and returns it read-latched.
