@@ -136,8 +136,8 @@ class BTree {
   int CheckSubtree(page_id_t id, const std::optional<std::string>& lo, const std::optional<std::string>& hi,
                    std::vector<page_id_t>* leaves, uint64_t* entries) const;
 
-  // Declared first so they are destroyed last: the pool flushes into the disk
-  // manager on destruction.
+  // disk_ is declared before pool_ so the pool, which flushes into the disk
+  // manager when it is destroyed, goes away first.
   std::unique_ptr<DiskManager> disk_;
   std::unique_ptr<BufferPool> pool_;
 
