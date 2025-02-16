@@ -7,7 +7,7 @@ namespace btreekv {
 
 namespace {
 
-const LeafNode LeafOf(const ReadPageGuard& guard) { return LeafNode(const_cast<char*>(guard.data())); }
+LeafNode LeafOf(const ReadPageGuard& guard) { return LeafNode(const_cast<char*>(guard.data())); }
 
 }  // namespace
 

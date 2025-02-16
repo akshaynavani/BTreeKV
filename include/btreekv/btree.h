@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "btreekv/buffer_pool.h"
 #include "btreekv/config.h"
@@ -81,6 +82,16 @@ class BTree {
   page_id_t PageCount() const { return disk_->PageCount(); }
   BufferPoolStats PoolStats() const { return pool_->stats(); }
 
+  // Number of pages currently on the free list.
+  size_t FreeListLength() const;
+
+  // Walks the whole tree and throws std::logic_error describing the first
+  // violation found: page ids, key order within nodes, keys within the
+  // separator bounds inherited from ancestors, node levels and tree height,
+  // the leaf chain visiting exactly the leaves in key order, and the entry
+  // count. Excludes writers for its duration; intended for tests and tools.
+  void CheckInvariants() const;
+
  private:
   void Bootstrap();
   void LoadMeta();
@@ -119,6 +130,11 @@ class BTree {
   // Read-crabs from the root to the leaf that would contain `key` (or to the
   // leftmost leaf) and returns it read-latched.
   ReadPageGuard DescendForRead(std::string_view key, bool leftmost) const;
+
+  // Validates the subtree at `id` whose keys must lie in [lo, hi); appends
+  // its leaves in order and counts entries. Returns the subtree's level.
+  int CheckSubtree(page_id_t id, const std::optional<std::string>& lo, const std::optional<std::string>& hi,
+                   std::vector<page_id_t>* leaves, uint64_t* entries) const;
 
   // Declared first so they are destroyed last: the pool flushes into the disk
   // manager on destruction.

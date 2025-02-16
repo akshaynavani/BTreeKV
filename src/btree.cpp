@@ -218,6 +218,109 @@ std::optional<std::string> BTree::Get(std::string_view key) const {
   return value;
 }
 
+// ---- Introspection ---------------------------------------------------------
+
+size_t BTree::FreeListLength() const {
+  std::lock_guard<std::mutex> writer(writer_mu_);
+  size_t length = 0;
+  page_id_t id = free_list_head_;
+  while (id != kInvalidPageId) {
+    if (++length > disk_->PageCount()) {
+      throw std::logic_error("free list contains a cycle");
+    }
+    ReadPageGuard guard = pool_->FetchRead(id);
+    id = SlottedPage(Bytes(guard)).link();
+  }
+  return length;
+}
+
+int BTree::CheckSubtree(page_id_t id, const std::optional<std::string>& lo, const std::optional<std::string>& hi,
+                        std::vector<page_id_t>* leaves, uint64_t* entries) const {
+  auto fail = [id](const std::string& what) {
+    throw std::logic_error("page " + std::to_string(id) + ": " + what);
+  };
+
+  ReadPageGuard guard = pool_->FetchRead(id);
+  const SlottedPage page(Bytes(guard));
+  if (page.page_id() != id) {
+    fail("header records page id " + std::to_string(page.page_id()));
+  }
+  if (page.type() != PageType::kLeaf && page.type() != PageType::kInternal) {
+    fail("reachable page is neither a leaf nor an internal node");
+  }
+
+  for (uint16_t i = 0; i < page.num_slots(); ++i) {
+    const std::string_view key = page.KeyAt(i);
+    if (i > 0 && !(page.KeyAt(static_cast<uint16_t>(i - 1)) < key)) {
+      fail("keys out of order at slot " + std::to_string(i));
+    }
+    if ((lo && key < std::string_view(*lo)) || (hi && key >= std::string_view(*hi))) {
+      fail("key at slot " + std::to_string(i) + " escapes its separator bounds");
+    }
+  }
+
+  if (page.type() == PageType::kLeaf) {
+    if (page.level() != 0) {
+      fail("leaf with non-zero level");
+    }
+    leaves->push_back(id);
+    *entries += page.num_slots();
+    return 0;
+  }
+
+  const InternalNode node(Bytes(guard));
+  if (node.level() == 0) {
+    fail("internal node at level 0");
+  }
+  for (size_t c = 0; c < node.num_children(); ++c) {
+    const std::optional<std::string> child_lo =
+        c == 0 ? lo : std::optional<std::string>(std::string(node.KeyAt(static_cast<uint16_t>(c - 1))));
+    const std::optional<std::string> child_hi =
+        c == node.num_keys() ? hi : std::optional<std::string>(std::string(node.KeyAt(static_cast<uint16_t>(c))));
+    const int child_level = CheckSubtree(node.ChildAt(c), child_lo, child_hi, leaves, entries);
+    if (child_level + 1 != node.level()) {
+      fail("child " + std::to_string(c) + " is at level " + std::to_string(child_level));
+    }
+  }
+  return node.level();
+}
+
+void BTree::CheckInvariants() const {
+  std::lock_guard<std::mutex> writer(writer_mu_);
+
+  page_id_t root;
+  {
+    ReadLatchGuard root_guard(root_latch_);
+    root = root_page_id_;
+  }
+
+  std::vector<page_id_t> leaves;
+  uint64_t entries = 0;
+  const int root_level = CheckSubtree(root, std::nullopt, std::nullopt, &leaves, &entries);
+  if (static_cast<uint32_t>(root_level) + 1 != Height()) {
+    throw std::logic_error("root level " + std::to_string(root_level) + " disagrees with height " +
+                           std::to_string(Height()));
+  }
+  if (entries != Size()) {
+    throw std::logic_error("leaves hold " + std::to_string(entries) + " entries but the tree counts " +
+                           std::to_string(Size()));
+  }
+
+  // The next links must thread the leaves in exactly in-order sequence.
+  page_id_t id = leaves.front();
+  for (size_t i = 0; i < leaves.size(); ++i) {
+    if (id != leaves[i]) {
+      throw std::logic_error("leaf chain reaches page " + std::to_string(id) + " where page " +
+                             std::to_string(leaves[i]) + " was expected");
+    }
+    ReadPageGuard guard = pool_->FetchRead(id);
+    id = LeafNode(Bytes(guard)).next_leaf();
+  }
+  if (id != kInvalidPageId) {
+    throw std::logic_error("leaf chain continues past the last leaf to page " + std::to_string(id));
+  }
+}
+
 // ---- Writes ----------------------------------------------------------------
 
 bool BTree::IsSafe(WritePageGuard& guard, std::string_view key, std::string_view value, WriteOp op) const {
