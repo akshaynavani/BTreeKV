@@ -49,6 +49,7 @@ if(BTREEKV_BUILD_TESTS)
 
   add_executable(btreekv_tests
     tests/btree_basic_test.cpp
+    tests/btree_random_test.cpp
     tests/buffer_pool_test.cpp
     tests/disk_manager_test.cpp
     tests/page_layout_test.cpp
