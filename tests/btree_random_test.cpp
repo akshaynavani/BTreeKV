@@ -3,9 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <map>
 #include <random>
 #include <string>
+#include <vector>
 
 #include "btreekv/btree.h"
 #include "test_util.h"
