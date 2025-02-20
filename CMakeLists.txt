@@ -29,6 +29,14 @@ target_include_directories(btreekv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(btreekv PUBLIC Threads::Threads)
 target_compile_options(btreekv PRIVATE -Wall -Wextra -Wpedantic)
 
+option(BTREEKV_BUILD_TOOLS "Build the CLI and benchmark" ON)
+
+if(BTREEKV_BUILD_TOOLS)
+  add_executable(btreekv_cli tools/btreekv_cli.cpp)
+  target_link_libraries(btreekv_cli PRIVATE btreekv)
+  target_compile_options(btreekv_cli PRIVATE -Wall -Wextra)
+endif()
+
 option(BTREEKV_BUILD_TESTS "Build the GoogleTest suite" ON)
 option(BTREEKV_USE_SYSTEM_GTEST "Use an installed GoogleTest instead of fetching it" OFF)
 
