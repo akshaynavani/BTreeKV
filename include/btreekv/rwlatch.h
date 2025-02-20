@@ -14,7 +14,21 @@ namespace btreekv {
 // re-entrant; a thread must not acquire a latch it already holds.
 class RWLatch {
  public:
-  RWLatch() { Check(pthread_rwlock_init(&lock_, nullptr), "pthread_rwlock_init"); }
+  RWLatch() {
+#if defined(__GLIBC__)
+    // glibc rwlocks prefer readers by default, which lets a steady stream of
+    // readers crabbing through the root starve the writer. Ask for writer
+    // preference instead (safe here because latches are never re-entered).
+    pthread_rwlockattr_t attr;
+    Check(pthread_rwlockattr_init(&attr), "pthread_rwlockattr_init");
+    pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    const int rc = pthread_rwlock_init(&lock_, &attr);
+    pthread_rwlockattr_destroy(&attr);
+    Check(rc, "pthread_rwlock_init");
+#else
+    Check(pthread_rwlock_init(&lock_, nullptr), "pthread_rwlock_init");
+#endif
+  }
   ~RWLatch() { pthread_rwlock_destroy(&lock_); }
 
   RWLatch(const RWLatch&) = delete;
