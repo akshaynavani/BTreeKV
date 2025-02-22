@@ -1,0 +1,21 @@
+# Build trees
+build/
+build-*/
+cmake-build-*/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+_deps/
+compile_commands.json
+
+# Database files produced by the CLI, benchmark and tests
+*.db
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
