@@ -35,6 +35,10 @@ if(BTREEKV_BUILD_TOOLS)
   add_executable(btreekv_cli tools/btreekv_cli.cpp)
   target_link_libraries(btreekv_cli PRIVATE btreekv)
   target_compile_options(btreekv_cli PRIVATE -Wall -Wextra)
+
+  add_executable(btreekv_bench tools/btreekv_bench.cpp)
+  target_link_libraries(btreekv_bench PRIVATE btreekv)
+  target_compile_options(btreekv_bench PRIVATE -Wall -Wextra)
 endif()
 
 option(BTREEKV_BUILD_TESTS "Build the GoogleTest suite" ON)
