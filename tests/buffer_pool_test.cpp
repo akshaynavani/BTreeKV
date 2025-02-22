@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "btreekv/disk_manager.h"
